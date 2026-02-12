@@ -455,6 +455,13 @@ async function getContentLengthWithRedirects(url, redirectCount, maxRedirects) {
         }
       }
 
+      // If HEAD returns 403 (forbidden), presigned URL doesn't allow HEAD - use Range
+      if (res.statusCode === 403) {
+        console.log('[getContentLength] HEAD forbidden (403), trying Range request');
+        req.destroy();
+        return getContentLengthViaRange(url, redirectCount, maxRedirects).then(resolve).catch(reject);
+      }
+
       const len = res.headers['content-length'];
       if (len != null) {
         const size = parseInt(len, 10);
