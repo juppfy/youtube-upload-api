@@ -32,6 +32,13 @@ let storedRefreshToken = null;
 // Parse JSON bodies (for metadata - actual video is streamed from URL)
 app.use(express.json({ limit: '1mb' }));
 
+// Request logging
+app.use((req, res, next) => {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] ${req.method} ${req.path}`);
+  next();
+});
+
 // API key middleware (only enforced when API_KEY env is set)
 const requireApiKey = (req, res, next) => {
   if (!API_KEY) return next();
@@ -134,8 +141,10 @@ app.get('/auth/status', (req, res) => {
 app.get('/job/:id', requireApiKey, (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) {
+    console.log('[job] Not found:', req.params.id);
     return res.status(404).json({ error: 'Job not found', jobId: req.params.id });
   }
+  console.log('[job] Poll:', req.params.id, 'status=', job.status);
   res.json(job);
 });
 
@@ -153,6 +162,7 @@ app.get('/job/:id', requireApiKey, (req, res) => {
  *   - sync: Optional - if true, wait for upload to complete before responding
  */
 app.post('/upload', requireApiKey, async (req, res) => {
+  console.log('[upload] POST /upload received');
   const {
     videoUrl,
     uploadUrl,
@@ -165,6 +175,8 @@ app.post('/upload', requireApiKey, async (req, res) => {
     contentType = 'video/webm',
     sync = false,
   } = req.body;
+
+  console.log('[upload] params:', { videoUrl: videoUrl?.slice(0, 60) + '...', hasUploadUrl: !!uploadUrl, contentType, sync });
 
   if (!videoUrl) {
     return res.status(400).json({
@@ -205,6 +217,7 @@ app.post('/upload', requireApiKey, async (req, res) => {
   }
 
   if (!accessToken) {
+    console.log('[upload] ERROR: Missing auth');
     return res.status(400).json({
       error: 'Missing auth',
       authOptions: 'Use Authorization: Bearer <token>, or body oauthToken, or (clientId + clientSecret + refreshToken)',
@@ -212,6 +225,7 @@ app.post('/upload', requireApiKey, async (req, res) => {
   }
 
   const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  console.log('[upload] Created job:', jobId);
 
   const job = {
     id: jobId,
@@ -257,6 +271,7 @@ app.post('/upload', requireApiKey, async (req, res) => {
 
   const runUpload = async () => {
     job.status = 'downloading';
+    console.log(`[${jobId}] Status: downloading`);
 
     try {
       // Resolve content length: use provided value, or fetch via HEAD
@@ -264,8 +279,10 @@ app.post('/upload', requireApiKey, async (req, res) => {
       if (resolvedContentLength == null) {
         resolvedContentLength = await getContentLength(videoUrl);
       }
+      console.log(`[${jobId}] Content length: ${resolvedContentLength} bytes (${(resolvedContentLength / 1024 / 1024).toFixed(2)} MB)`);
 
       job.status = 'uploading';
+      console.log(`[${jobId}] Status: uploading to YouTube`);
 
       const result = await streamVideoToYouTube({
         videoUrl,
@@ -278,6 +295,7 @@ app.post('/upload', requireApiKey, async (req, res) => {
       job.status = 'completed';
       job.completedAt = new Date().toISOString();
       job.result = result;
+      console.log(`[${jobId}] Status: completed. videoId=${result.videoId}`);
     } catch (err) {
       job.status = 'failed';
       job.completedAt = new Date().toISOString();
@@ -285,7 +303,7 @@ app.post('/upload', requireApiKey, async (req, res) => {
         message: err.message,
         code: err.code,
       };
-      console.error(`[${jobId}] Upload failed:`, err);
+      console.error(`[${jobId}] Upload FAILED:`, err.message, err.code || '');
     }
   };
 
@@ -306,6 +324,7 @@ app.post('/upload', requireApiKey, async (req, res) => {
       });
   } else {
     // Asynchronous mode: respond immediately with job ID
+    console.log(`[upload] Responding 202, job ${jobId} running in background`);
     res.status(202).json({
       jobId,
       status: 'accepted',
@@ -347,8 +366,10 @@ async function createResumableSession(accessToken, videoMetadata, contentType, c
         res.on('end', () => {
           const location = res.headers.location;
           if (location) {
+            console.log('[createResumableSession] OK, got upload URL');
             resolve(location);
           } else {
+            console.log('[createResumableSession] FAIL:', res.statusCode, data?.slice(0, 200));
             reject(new Error(data || `HTTP ${res.statusCode}`));
           }
         });
@@ -418,13 +439,19 @@ async function getContentLength(url) {
     const req = client.request(url, { method: 'HEAD' }, (res) => {
       const len = res.headers['content-length'];
       if (len != null) {
-        resolve(parseInt(len, 10));
+        const size = parseInt(len, 10);
+        console.log('[getContentLength] OK:', size, 'bytes');
+        resolve(size);
       } else {
+        console.log('[getContentLength] FAIL: no Content-Length');
         reject(new Error('Source URL does not provide Content-Length. Pass contentLength in the request body.'));
       }
     });
 
-    req.on('error', reject);
+    req.on('error', (e) => {
+      console.log('[getContentLength] ERROR:', e.message);
+      reject(e);
+    });
     req.setTimeout(15000, () => {
       req.destroy(new Error('HEAD request timeout'));
     });
@@ -441,6 +468,7 @@ async function streamVideoToYouTube({ videoUrl, uploadUrl, oauthToken, contentTy
   let lastError;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    console.log('[streamUpload] Attempt', attempt, 'of', maxRetries);
     try {
       const result = await attemptStreamUpload({ videoUrl, uploadUrl, oauthToken, contentType, contentLength });
       return result;
@@ -467,12 +495,16 @@ async function attemptStreamUpload({ videoUrl, uploadUrl, oauthToken, contentTyp
     const parsedSource = new URL(videoUrl);
     const httpModule = parsedSource.protocol === 'https:' ? https : http;
 
+    console.log('[attemptStreamUpload] Starting download from', videoUrl.slice(0, 60) + '...');
+
     // Initiate download stream
     const getReq = httpModule.get(videoUrl, (getRes) => {
       if (getRes.statusCode >= 400) {
+        console.log('[attemptStreamUpload] Download FAILED HTTP', getRes.statusCode);
         reject(new Error(`Failed to download video: HTTP ${getRes.statusCode}`));
         return;
       }
+      console.log('[attemptStreamUpload] Download started, piping to YouTube PUT');
 
       const uploadOptions = {
         method: 'PUT',
@@ -490,12 +522,16 @@ async function attemptStreamUpload({ videoUrl, uploadUrl, oauthToken, contentTyp
         let body = '';
         putRes.on('data', (chunk) => { body += chunk; });
         putRes.on('end', () => {
+          console.log('[attemptStreamUpload] YouTube response: HTTP', putRes.statusCode, 'body length:', body.length);
           if (putRes.statusCode === 201 || putRes.statusCode === 200) {
             let videoId = null;
             try {
               const json = JSON.parse(body);
               videoId = json.id || null;
-            } catch (_) {}
+              console.log('[attemptStreamUpload] Parsed videoId:', videoId);
+            } catch (_) {
+              console.log('[attemptStreamUpload] Could not parse response as JSON');
+            }
 
             resolve({
               statusCode: putRes.statusCode,
@@ -508,6 +544,7 @@ async function attemptStreamUpload({ videoUrl, uploadUrl, oauthToken, contentTyp
             err.statusCode = 308;
             reject(err);
           } else {
+            console.log('[attemptStreamUpload] YouTube ERROR:', putRes.statusCode, body.slice(0, 200));
             const err = new Error(`YouTube upload failed: HTTP ${putRes.statusCode} - ${body}`);
             err.statusCode = putRes.statusCode;
             err.body = body;
@@ -517,18 +554,24 @@ async function attemptStreamUpload({ videoUrl, uploadUrl, oauthToken, contentTyp
       });
 
       putReq.on('error', (err) => {
+        console.log('[attemptStreamUpload] PUT error:', err.message);
         reject(err);
       });
 
       // Pipe download stream directly to upload (no buffering)
-      pipelineAsync(getRes, putReq).catch(reject);
+      pipelineAsync(getRes, putReq).catch((pipeErr) => {
+        console.log('[attemptStreamUpload] Pipeline error:', pipeErr?.message || pipeErr);
+        reject(pipeErr);
+      });
     });
 
     getReq.on('error', (err) => {
+      console.log('[attemptStreamUpload] GET error:', err.message);
       reject(err);
     });
 
     getReq.setTimeout(60000, () => {
+      console.log('[attemptStreamUpload] Download timeout (60s)');
       getReq.destroy(new Error('Download timeout'));
     });
   });
