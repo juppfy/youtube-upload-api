@@ -176,7 +176,8 @@ app.post('/upload', requireApiKey, async (req, res) => {
     sync = false,
   } = req.body;
 
-  console.log('[upload] params:', { videoUrl: videoUrl?.slice(0, 60) + '...', hasUploadUrl: !!uploadUrl, contentType, sync });
+  console.log('[upload] params:', { hasUploadUrl: !!uploadUrl, contentType, sync });
+  console.log('[upload] FULL videoUrl:', videoUrl);
 
   if (!videoUrl) {
     return res.status(400).json({
@@ -442,6 +443,7 @@ async function getContentLengthWithRedirects(url, redirectCount, maxRedirects) {
 
     const options = { method: 'HEAD' };
     const req = client.request(url, options, (res) => {
+      console.log('[getContentLength] Response status:', res.statusCode, 'Content-Type:', res.headers['content-type']);
       // Follow redirects (presigned URLs often redirect)
       if ([301, 302, 307, 308].includes(res.statusCode)) {
         const location = res.headers.location;
@@ -556,6 +558,7 @@ async function attemptStreamUploadWithRedirects({ videoUrl, uploadUrl, oauthToke
     console.log('[attemptStreamUpload] Starting download from', videoUrl.slice(0, 60) + '...');
 
     const getReq = httpModule.get(videoUrl, (getRes) => {
+      console.log('[attemptStreamUpload] Response status:', getRes.statusCode, 'Content-Type:', getRes.headers['content-type'], 'Content-Length:', getRes.headers['content-length']);
       // Follow redirects (presigned URLs often redirect)
       if ([301, 302, 307, 308].includes(getRes.statusCode)) {
         const location = getRes.headers.location;
