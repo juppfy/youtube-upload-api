@@ -20,11 +20,14 @@ The server runs on `http://localhost:3000` (or `PORT` env var).
 
 ## API Endpoints
 
-| Method | Path        | Description                    |
-|--------|-------------|--------------------------------|
-| GET    | `/health`   | Health check                   |
-| POST   | `/upload`   | Start a YouTube video upload   |
-| GET    | `/job/:id`  | Get upload job status          |
+| Method | Path                  | Description                                |
+|--------|-----------------------|--------------------------------------------|
+| GET    | `/health`             | Health check                               |
+| GET    | `/auth/youtube`       | Start OAuth flow (visit in browser once)   |
+| GET    | `/auth/youtube/callback` | OAuth callback (handled automatically) |
+| GET    | `/auth/status`        | Check if YouTube is connected              |
+| POST   | `/upload`             | Start a YouTube video upload               |
+| GET    | `/job/:id`            | Get upload job status                      |
 
 ### POST /upload
 
@@ -33,9 +36,14 @@ The server runs on `http://localhost:3000` (or `PORT` env var).
 | Field          | Type   | Required | Description                                                                 |
 |----------------|--------|----------|-----------------------------------------------------------------------------|
 | `videoUrl`     | string | Yes      | URL to download the video from (must support HEAD for Content-Length)       |
-| `uploadUrl`    | string | Yes      | YouTube resumable upload URL (from setup node's `json.headers.location`)    |
-| `oauthToken`   | string | Yes      | YouTube OAuth 2.0 access token                                              |
-| `videoMetadata`| object | No       | Snippet/status metadata (for logging/reference)                             |
+| `uploadUrl`    | string | No*      | YouTube resumable upload URL (omit if using in-app OAuth)                   |
+| `videoMetadata`| object | No*      | Required when `uploadUrl` omitted: `{snippet:{title,...}, status:{privacyStatus}}` |
+| `oauthToken`   | string | No*      | YouTube OAuth 2.0 access token (or use `Authorization: Bearer` header)      |
+| `clientId`     | string | No*      | Google OAuth2 client ID (use with clientSecret + refreshToken)              |
+| `clientSecret` | string | No*      | Google OAuth2 client secret                                                 |
+| `refreshToken` | string | No*      | OAuth2 refresh token                                                        |
+
+*Auth: Use in-app OAuth (visit `/auth/youtube` once), OR `Authorization: Bearer`, OR body `oauthToken`, OR (`clientId`+`clientSecret`+`refreshToken`).
 | `contentLength`| number | No       | File size in bytes; if omitted, a HEAD request fetches it                   |
 | `contentType`  | string | No       | MIME type (default: `video/webm`)                                           |
 | `sync`         | boolean| No       | If `true`, wait for upload to finish before responding (default: `false`)   |
@@ -68,31 +76,13 @@ The server runs on `http://localhost:3000` (or `PORT` env var).
 
 ## n8n Integration
 
-### Workflow Setup
+**Easiest:** Set `BASE_URL`, `YOUTUBE_CLIENT_ID`, `YOUTUBE_CLIENT_SECRET` in env, add redirect URI to Google Console, visit `{BASE_URL}/auth/youtube` once, then n8n only needs:
 
-1. **YouTube OAuth + Setup node**  
-   Use YouTube nodes to authenticate and create a resumable upload session. Capture:
-   - `uploadUrl` from `json.headers.location`
-   - `oauthToken` from your OAuth credentials
+```json
+{ "videoUrl": "{{ $json.videoUrl }}", "videoMetadata": { "snippet": { "title": "My Video" }, "status": { "privacyStatus": "private" } } }
+```
 
-2. **HTTP Request node** (instead of the built-in YouTube upload node)
-   - **Method**: POST
-   - **URL**: `https://your-app.railway.app/upload` (or your deployed URL)
-   - **Body Content Type**: JSON
-   - **Body**:
-   ```json
-   {
-     "videoUrl": "{{ $json.videoUrl }}",
-     "uploadUrl": "{{ $json.uploadUrl }}",
-     "oauthToken": "{{ $json.oauthToken }}",
-     "contentType": "video/webm",
-     "sync": false
-   }
-   ```
-
-3. **Poll for completion** (if async):
-   - Use a **Wait** node (e.g. 30s), then an **HTTP Request** to `GET /job/{{ $json.jobId }}`
-   - Loop until `status === 'completed'` or `status === 'failed'`
+See [docs/N8N-WORKFLOW.md](docs/N8N-WORKFLOW.md) for full setup and other auth options (Authorization header, refresh token).
 
 ### Example n8n Expression for uploadUrl
 
@@ -136,13 +126,14 @@ railway domain
 
 ### Environment Variables
 
-Railway sets `PORT` automatically. If needed, add:
+| Variable | Description |
+|----------|-------------|
+| `PORT` | Set by Railway automatically |
+| `BASE_URL` | Your public URL (e.g. `https://your-app.railway.app`) — required for in-app OAuth |
+| `YOUTUBE_CLIENT_ID` | Google OAuth Client ID — for in-app OAuth |
+| `YOUTUBE_CLIENT_SECRET` | Google OAuth Client Secret — for in-app OAuth |
 
-| Variable | Description        |
-|----------|--------------------|
-| `PORT`   | Server port (Railway provides this) |
-
-No YouTube credentials are stored on the server; they are passed per request from n8n.
+With in-app OAuth, credentials are stored on the server after you visit `/auth/youtube` once.
 
 ## Environment Configuration
 

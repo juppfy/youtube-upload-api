@@ -18,9 +18,15 @@ const pipelineAsync = promisify(pipeline);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const YOUTUBE_CLIENT_ID = process.env.YOUTUBE_CLIENT_ID;
+const YOUTUBE_CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET;
 
 // In-memory job store (use Redis/database in production for persistence)
 const jobs = new Map();
+
+// Stored refresh token from in-app OAuth (survives until server restart)
+let storedRefreshToken = null;
 
 // Parse JSON bodies (for metadata - actual video is streamed from URL)
 app.use(express.json({ limit: '1mb' }));
@@ -28,6 +34,89 @@ app.use(express.json({ limit: '1mb' }));
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+/**
+ * GET /auth/youtube - Start OAuth flow. Redirects to Google.
+ * One-time setup: add redirect URI to Google Console: {BASE_URL}/auth/youtube/callback
+ */
+app.get('/auth/youtube', (req, res) => {
+  if (!YOUTUBE_CLIENT_ID) {
+    return res.status(500).json({
+      error: 'YOUTUBE_CLIENT_ID not set',
+      hint: 'Set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET in env, then add redirect URI to Google Console',
+    });
+  }
+  const redirectUri = `${BASE_URL.replace(/\/$/, '')}/auth/youtube/callback`;
+  const scopes = encodeURIComponent('https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube');
+  const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${YOUTUBE_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scopes}&access_type=offline&prompt=consent`;
+  res.redirect(url);
+});
+
+/**
+ * GET /auth/youtube/callback - OAuth callback. Stores refresh token.
+ */
+app.get('/auth/youtube/callback', async (req, res) => {
+  const { code, error } = req.query;
+  if (error) {
+    return res.status(400).send(`<h1>OAuth Error</h1><p>${error}</p>`);
+  }
+  if (!code || !YOUTUBE_CLIENT_ID || !YOUTUBE_CLIENT_SECRET) {
+    return res.status(400).send('<h1>Missing code or credentials</h1>');
+  }
+  const redirectUri = `${BASE_URL.replace(/\/$/, '')}/auth/youtube/callback`;
+  const body = new URLSearchParams({
+    client_id: YOUTUBE_CLIENT_ID,
+    client_secret: YOUTUBE_CLIENT_SECRET,
+    code,
+    grant_type: 'authorization_code',
+    redirect_uri: redirectUri,
+  }).toString();
+
+  return new Promise((resolveOuter) => {
+    const req2 = https.request(
+      {
+        hostname: 'oauth2.googleapis.com',
+        path: '/token',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (res2) => {
+        let data = '';
+        res2.on('data', (chunk) => { data += chunk; });
+        res2.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            if (json.refresh_token) {
+              storedRefreshToken = json.refresh_token;
+              res.status(200).send('<h1>Success</h1><p>YouTube is now connected. You can close this page and use the API from n8n. No tokens needed in requests.</p>');
+            } else {
+              res.status(400).send(`<h1>No refresh token</h1><p>${json.error_description || JSON.stringify(json)}</p>`);
+            }
+          } catch (e) {
+            res.status(500).send(`<h1>Error</h1><p>${data}</p>`);
+          }
+          resolveOuter();
+        });
+      }
+    );
+    req2.on('error', (err) => {
+      res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+      resolveOuter();
+    });
+    req2.write(body);
+    req2.end();
+  });
+});
+
+/**
+ * GET /auth/status - Check if OAuth has been completed
+ */
+app.get('/auth/status', (req, res) => {
+  res.json({ connected: !!storedRefreshToken });
 });
 
 /**
@@ -47,19 +136,69 @@ app.get('/job/:id', (req, res) => {
  * Body:
  *   - videoUrl: URL to download the video from
  *   - uploadUrl: YouTube resumable upload URL (from setup node's json.headers.location)
- *   - oauthToken: YouTube OAuth 2.0 access token
+ *   - oauthToken: YouTube OAuth 2.0 access token (use this OR clientId+clientSecret+refreshToken)
+ *   - clientId, clientSecret, refreshToken: Alternative - we exchange for access token (no Code node needed)
  *   - videoMetadata: Optional snippet/status metadata (for logging)
  *   - contentLength: Optional - if known, avoids HEAD request
  *   - contentType: Optional - defaults to 'video/webm'
  *   - sync: Optional - if true, wait for upload to complete before responding
  */
 app.post('/upload', async (req, res) => {
-  const { videoUrl, uploadUrl, oauthToken, videoMetadata, contentLength, contentType = 'video/webm', sync = false } = req.body;
+  const {
+    videoUrl,
+    uploadUrl,
+    oauthToken,
+    clientId,
+    clientSecret,
+    refreshToken,
+    videoMetadata,
+    contentLength,
+    contentType = 'video/webm',
+    sync = false,
+  } = req.body;
 
-  if (!videoUrl || !uploadUrl || !oauthToken) {
+  if (!videoUrl) {
     return res.status(400).json({
-      error: 'Missing required fields',
-      required: ['videoUrl', 'uploadUrl', 'oauthToken'],
+      error: 'Missing required field: videoUrl',
+      authOptions: 'If using stored OAuth (visit /auth/youtube first), also send videoMetadata. Otherwise provide uploadUrl.',
+    });
+  }
+
+  // Resolve access token: 1) Authorization header, 2) body oauthToken, 3) refresh token in body, 4) stored token from /auth/youtube
+  let accessToken = oauthToken;
+  const authHeader = req.headers.authorization;
+  if (!accessToken && authHeader && /^Bearer\s+/i.test(authHeader)) {
+    accessToken = authHeader.replace(/^Bearer\s+/i, '').trim();
+  }
+  if (!accessToken && clientId && clientSecret && refreshToken) {
+    try {
+      accessToken = await getAccessTokenFromRefresh({ clientId, clientSecret, refreshToken });
+    } catch (err) {
+      return res.status(400).json({
+        error: 'Failed to get access token from refresh token',
+        message: err.message,
+      });
+    }
+  }
+  if (!accessToken && storedRefreshToken && YOUTUBE_CLIENT_ID && YOUTUBE_CLIENT_SECRET) {
+    try {
+      accessToken = await getAccessTokenFromRefresh({
+        clientId: YOUTUBE_CLIENT_ID,
+        clientSecret: YOUTUBE_CLIENT_SECRET,
+        refreshToken: storedRefreshToken,
+      });
+    } catch (err) {
+      return res.status(401).json({
+        error: 'Stored token expired or invalid. Visit /auth/youtube again to reconnect.',
+        message: err.message,
+      });
+    }
+  }
+
+  if (!accessToken) {
+    return res.status(400).json({
+      error: 'Missing auth',
+      authOptions: 'Use Authorization: Bearer <token>, or body oauthToken, or (clientId + clientSecret + refreshToken)',
     });
   }
 
@@ -77,6 +216,36 @@ app.post('/upload', async (req, res) => {
 
   jobs.set(jobId, job);
 
+  // Resolve uploadUrl: provided or create via YouTube API (requires videoMetadata when creating)
+  let resolvedUploadUrl = uploadUrl;
+  if (!resolvedUploadUrl) {
+    if (!videoMetadata || !videoMetadata.snippet) {
+      return res.status(400).json({
+        error: 'Missing uploadUrl and videoMetadata.snippet',
+        hint: 'Either provide uploadUrl from your setup node, OR use stored OAuth (/auth/youtube) and provide videoMetadata with snippet (title, description, etc.)',
+      });
+    }
+    let sizeForSession = contentLength;
+    if (sizeForSession == null) {
+      try {
+        sizeForSession = await getContentLength(videoUrl);
+      } catch (e) {
+        return res.status(400).json({
+          error: 'Could not get video size. Pass contentLength in body or ensure videoUrl returns Content-Length.',
+          message: e.message,
+        });
+      }
+    }
+    try {
+      resolvedUploadUrl = await createResumableSession(accessToken, videoMetadata, contentType, sizeForSession);
+    } catch (err) {
+      return res.status(400).json({
+        error: 'Failed to create YouTube upload session',
+        message: err.message,
+      });
+    }
+  }
+
   const runUpload = async () => {
     job.status = 'downloading';
 
@@ -91,8 +260,8 @@ app.post('/upload', async (req, res) => {
 
       const result = await streamVideoToYouTube({
         videoUrl,
-        uploadUrl,
-        oauthToken,
+        uploadUrl: resolvedUploadUrl,
+        oauthToken: accessToken,
         contentType,
         contentLength: resolvedContentLength,
       });
@@ -140,6 +309,93 @@ app.post('/upload', async (req, res) => {
     });
   }
 });
+
+/**
+ * Create a YouTube resumable upload session. Returns the upload URL from Location header.
+ */
+async function createResumableSession(accessToken, videoMetadata, contentType, contentLength) {
+  const body = JSON.stringify(videoMetadata);
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json; charset=UTF-8',
+    'Content-Length': Buffer.byteLength(body),
+    'X-Upload-Content-Type': contentType,
+  };
+  if (contentLength != null) {
+    headers['X-Upload-Content-Length'] = String(contentLength);
+  }
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: 'www.googleapis.com',
+        path: '/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
+        method: 'POST',
+        headers,
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          const location = res.headers.location;
+          if (location) {
+            resolve(location);
+          } else {
+            reject(new Error(data || `HTTP ${res.statusCode}`));
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * Exchange a refresh token for an access token via Google OAuth2.
+ * Use this when you can't get the access token from n8n (e.g. getCredentials fails).
+ */
+async function getAccessTokenFromRefresh({ clientId, clientSecret, refreshToken }) {
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type: 'refresh_token',
+  }).toString();
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: 'oauth2.googleapis.com',
+        path: '/token',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            if (json.access_token) {
+              resolve(json.access_token);
+            } else {
+              reject(new Error(json.error_description || json.error || 'No access_token in response'));
+            }
+          } catch (e) {
+            reject(new Error(`Token response parse error: ${data}`));
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
 
 /**
  * Fetch Content-Length from source URL via HEAD request.
@@ -283,4 +539,7 @@ app.listen(PORT, () => {
   console.log(`Health: GET /health`);
   console.log(`Upload: POST /upload`);
   console.log(`Status: GET /job/:id`);
+  if (YOUTUBE_CLIENT_ID) {
+    console.log(`OAuth setup: GET ${BASE_URL}/auth/youtube (visit in browser once to connect)`);
+  }
 });
